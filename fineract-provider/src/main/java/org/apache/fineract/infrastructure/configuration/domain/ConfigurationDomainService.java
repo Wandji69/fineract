@@ -55,9 +55,9 @@ public interface ConfigurationDomainService {
 
     Integer retrieveFinancialYearBeginningMonth();
 
-    public Integer retrieveMinAllowedClientsInGroup();
+    Integer retrieveMinAllowedClientsInGroup();
 
-    public Integer retrieveMaxAllowedClientsInGroup();
+    Integer retrieveMaxAllowedClientsInGroup();
 
     boolean isMeetingMandatoryForJLGLoans();
 
@@ -96,4 +96,6 @@ public interface ConfigurationDomainService {
     boolean isSubRatesEnabled();
 
     boolean isFirstRepaymentDateAfterRescheduleAllowedOnHoliday();
+
+    boolean isInterestToBeAppropriatedEquallyWhenGreaterThanEMI();
 }
