@@ -21,6 +21,7 @@ package org.apache.fineract.infrastructure.documentmanagement.api;
 import com.sun.jersey.core.header.FormDataContentDisposition;
 import com.sun.jersey.multipart.FormDataBodyPart;
 import com.sun.jersey.multipart.FormDataParam;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.Base64;
 import javax.ws.rs.Consumes;
@@ -35,14 +36,15 @@ import javax.ws.rs.Produces;
 import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import javax.ws.rs.core.Response.ResponseBuilder;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.fineract.infrastructure.core.data.CommandProcessingResult;
 import org.apache.fineract.infrastructure.core.domain.Base64EncodedImage;
 import org.apache.fineract.infrastructure.core.serialization.DefaultToApiJsonSerializer;
 import org.apache.fineract.infrastructure.documentmanagement.contentrepository.ContentRepositoryUtils;
 import org.apache.fineract.infrastructure.documentmanagement.contentrepository.ContentRepositoryUtils.ImageFileExtension;
-import org.apache.fineract.infrastructure.documentmanagement.data.ImageData;
+import org.apache.fineract.infrastructure.documentmanagement.data.FileData;
+import org.apache.fineract.infrastructure.documentmanagement.data.ImageResizer;
+import org.apache.fineract.infrastructure.documentmanagement.exception.ContentManagementException;
 import org.apache.fineract.infrastructure.documentmanagement.exception.InvalidEntityTypeForImageManagementException;
 import org.apache.fineract.infrastructure.documentmanagement.service.ImageReadPlatformService;
 import org.apache.fineract.infrastructure.documentmanagement.service.ImageWritePlatformService;
@@ -52,24 +54,28 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Scope;
 import org.springframework.stereotype.Component;
 
-@Path("{entity}/{entityId}/images")
 @Component
 @Scope("singleton")
-
+@Path("{entity}/{entityId}/images")
 public class ImagesApiResource {
 
     private final PlatformSecurityContext context;
     private final ImageReadPlatformService imageReadPlatformService;
     private final ImageWritePlatformService imageWritePlatformService;
     private final DefaultToApiJsonSerializer<ClientData> toApiJsonSerializer;
+    private final FileUploadValidator fileUploadValidator;
+    private final ImageResizer imageResizer;
 
     @Autowired
     public ImagesApiResource(final PlatformSecurityContext context, final ImageReadPlatformService readPlatformService,
-            final ImageWritePlatformService imageWritePlatformService, final DefaultToApiJsonSerializer<ClientData> toApiJsonSerializer) {
+            final ImageWritePlatformService imageWritePlatformService, final DefaultToApiJsonSerializer<ClientData> toApiJsonSerializer,
+            final FileUploadValidator fileUploadValidator, final ImageResizer imageResizer) {
         this.context = context;
         this.imageReadPlatformService = readPlatformService;
         this.imageWritePlatformService = imageWritePlatformService;
         this.toApiJsonSerializer = toApiJsonSerializer;
+        this.fileUploadValidator = fileUploadValidator;
+        this.imageResizer = imageResizer;
     }
 
     /**
@@ -82,6 +88,7 @@ public class ImagesApiResource {
             @HeaderParam("Content-Length") final Long fileSize, @FormDataParam("file") final InputStream inputStream,
             @FormDataParam("file") final FormDataContentDisposition fileDetails, @FormDataParam("file") final FormDataBodyPart bodyPart) {
         validateEntityTypeforImage(entityName);
+        fileUploadValidator.validate(fileSize, inputStream, fileDetails, bodyPart);
         // TODO: vishwas might need more advances validation (like reading magic
         // number) for handling malicious clients
         // and clients not setting mime type
@@ -103,6 +110,7 @@ public class ImagesApiResource {
     public String addNewClientImage(@PathParam("entity") final String entityName, @PathParam("entityId") final Long entityId,
             final String jsonRequestBody) {
         validateEntityTypeforImage(entityName);
+
         final Base64EncodedImage base64EncodedImage = ContentRepositoryUtils.extractImageFromDataURL(jsonRequestBody);
 
         final CommandProcessingResult result = this.imageWritePlatformService.saveOrUpdateImage(entityName, entityId, base64EncodedImage);
@@ -130,19 +138,24 @@ public class ImagesApiResource {
             return downloadClientImage(entityName, entityId, maxWidth, maxHeight, output);
         }
 
-        final ImageData imageData = this.imageReadPlatformService.retrieveImage(entityName, entityId);
+        final FileData imageData = this.imageReadPlatformService.retrieveImage(entityName, entityId);
 
         // TODO: Need a better way of determining image type
         String imageDataURISuffix = ContentRepositoryUtils.ImageDataURIsuffix.JPEG.getValue();
-        if (StringUtils.endsWith(imageData.location(), ContentRepositoryUtils.ImageFileExtension.GIF.getValue())) {
+        if (StringUtils.endsWith(imageData.name(), ContentRepositoryUtils.ImageFileExtension.GIF.getValue())) {
             imageDataURISuffix = ContentRepositoryUtils.ImageDataURIsuffix.GIF.getValue();
-        } else if (StringUtils.endsWith(imageData.location(), ContentRepositoryUtils.ImageFileExtension.PNG.getValue())) {
+        } else if (StringUtils.endsWith(imageData.name(), ContentRepositoryUtils.ImageFileExtension.PNG.getValue())) {
             imageDataURISuffix = ContentRepositoryUtils.ImageDataURIsuffix.PNG.getValue();
         }
 
-        byte[] resizedImage = imageData.getContentOfSize(maxWidth, maxHeight);
-        final String clientImageAsBase64Text = imageDataURISuffix + Base64.getMimeEncoder().encodeToString(resizedImage);
-        return Response.ok(clientImageAsBase64Text).build();
+        FileData resizedImage = imageResizer.resize(imageData, maxWidth, maxHeight);
+        try {
+            byte[] resizedImageBytes = resizedImage.getByteSource().read();
+            final String clientImageAsBase64Text = imageDataURISuffix + Base64.getMimeEncoder().encodeToString(resizedImageBytes);
+            return Response.ok(clientImageAsBase64Text).build();
+        } catch (IOException e) {
+            throw new ContentManagementException(imageData.name(), e.getMessage(), e);
+        }
     }
 
     @GET
@@ -158,17 +171,10 @@ public class ImagesApiResource {
             this.context.authenticatedUser().validateHasReadPermission("STAFFIMAGE");
         }
 
-        final ImageData imageData = this.imageReadPlatformService.retrieveImage(entityName, entityId);
-
-        final ResponseBuilder response = Response.ok(imageData.getContentOfSize(maxWidth, maxHeight));
-        String dispositionType = "inline_octet".equals(output) ? "inline" : "attachment";
-        response.header("Content-Disposition",
-                dispositionType + "; filename=\"" + imageData.getEntityDisplayName() + ImageFileExtension.JPEG + "\"");
-
-        // TODO: Need a better way of determining image type
-
-        response.header("Content-Type", imageData.contentType());
-        return response.build();
+        final FileData imageData = this.imageReadPlatformService.retrieveImage(entityName, entityId);
+        final FileData resizedImage = imageResizer.resize(imageData, maxWidth, maxHeight);
+        return ContentResources.fileDataToResponse(resizedImage, resizedImage.name() + ImageFileExtension.JPEG,
+                "inline_octet".equals(output) ? "inline" : "attachment");
     }
 
     /**
